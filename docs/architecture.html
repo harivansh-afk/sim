@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>sim architecture (HTML input test)</title>
+</head>
+<body>
+  <h1>sim architecture: the HTML path</h1>
+
+  <p>
+    This page tests the <strong>HTML adapter</strong>. Open it with
+    <code>sim docs/architecture.html</code>: it converts once through
+    <em>rehype-parse and rehype-remark</em> into the same block model the
+    markdown adapter produces, then renders identically.
+  </p>
+
+  <blockquote>
+    <p>
+      HTML documents are readonly by construction: the adapter omits
+      <code>serialize</code>, so <code>writeback</code> is false and the
+      status bar shows a readonly badge. Try <code>x</code> on the list
+      below: sim refuses politely.
+    </p>
+  </blockquote>
+
+  <h2>What conversion preserves</h2>
+
+  <table>
+    <thead>
+      <tr><th>HTML element</th><th>Becomes</th><th>Fidelity</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>h1 to h6</td><td>ATX headings</td><td>full</td></tr>
+      <tr><td>table</td><td>GFM pipe table</td><td>loses colspan/rowspan</td></tr>
+      <tr><td>pre + code</td><td>fenced code block</td><td>full text, language from class</td></tr>
+      <tr><td>a href</td><td>markdown link</td><td>full</td></tr>
+      <tr><td>script, style</td><td>dropped</td><td>by design</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Readonly proof</h2>
+
+  <p>These convert to task list items; toggling them is refused:</p>
+
+  <ul>
+    <li><input type="checkbox" disabled> select me with tab, press x</li>
+    <li><input type="checkbox" checked disabled> the status bar explains why</li>
+  </ul>
+
+  <h2>Structure survives</h2>
+
+  <ol>
+    <li>Ordered lists convert to markdown numbering</li>
+    <li>Nested structure holds:
+      <ul>
+        <li>inner bullets stay nested</li>
+        <li>with <strong>bold</strong>, <em>italic</em>, and <code>inline code</code></li>
+      </ul>
+    </li>
+    <li><a href="https://git.harivan.sh/harivansh-afk/sim">links keep their targets</a></li>
+  </ol>
+
+  <h2>Code blocks</h2>
+
+  <pre><code class="language-ts">// the adapter, in essence
+const markdown = String(htmlToMd.processSync(fileText));
+return { root: parseMarkdown(markdown), text: markdown, writeback: false };
+</code></pre>
+
+  <h2>Why one-way</h2>
+
+  <p>
+    No source positions map back to the original HTML after conversion, so a
+    positional splice into the <code>.html</code> file is impossible. Rather
+    than guess with a lossy serializer, sim keeps the file untouchable. The
+    day HTML needs editing, that is a new adapter contract, not a patch.
+  </p>
+</body>
+</html>
