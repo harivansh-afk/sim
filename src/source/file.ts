@@ -58,14 +58,14 @@ export class FileSource {
     if (current.version.sha256 !== base.sha256) {
       return { ok: false, reason: "conflict" };
     }
-    const dir = await mkdtemp(join(tmpdir(), "tn-"));
+    const dir = await mkdtemp(join(tmpdir(), "sim-"));
     const tmp = join(dir, basename(this.path));
     try {
       await writeFile(tmp, text, "utf8");
       await rename(tmp, this.path);
     } catch {
       // Cross-device tmpdir: fall back to a sibling temp file, same rename.
-      const sibling = join(dirname(this.path), `.${basename(this.path)}.tn-tmp`);
+      const sibling = join(dirname(this.path), `.${basename(this.path)}.sim-tmp`);
       await writeFile(sibling, text, "utf8");
       await rename(sibling, this.path);
     } finally {

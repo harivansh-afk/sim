@@ -4,7 +4,7 @@ import { openDocument } from "./document/store.ts";
 import { FileSource } from "./source/file.ts";
 import { runPager } from "./shell/pager.ts";
 
-const USAGE = `usage: tn <file.md|file.html> [--plain]
+const USAGE = `usage: sim <file.md|file.html> [--plain]
 
 Renders markdown and html in the terminal.
 Interactive pager on a TTY; plain text when piped or with --plain.`;
@@ -13,9 +13,10 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const plain = args.includes("--plain");
   const path = args.find((a) => !a.startsWith("-"));
-  if (!path || args.includes("--help") || args.includes("-h")) {
+  const help = args.includes("--help") || args.includes("-h");
+  if (!path || help) {
     process.stdout.write(`${USAGE}\n`);
-    process.exit(path ? 0 : 1);
+    process.exit(help ? 0 : 1);
   }
 
   if (plain || !process.stdout.isTTY) {
@@ -34,6 +35,6 @@ async function main(): Promise<void> {
 
 main().catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);
-  process.stderr.write(`tn: ${message}\n`);
+  process.stderr.write(`sim: ${message}\n`);
   process.exit(1);
 });

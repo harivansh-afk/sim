@@ -1,6 +1,6 @@
-# tui-notes (name TBD)
+# sim
 
-bat-like CLI: `<cmd> file.md` renders Markdown or HTML natively in the terminal.
+bat-like CLI: `sim file.md` renders Markdown or HTML natively in the terminal.
 Interactive pager when on a TTY, plain text when piped. Typst deferred past alpha.
 
 ## Stack (pinned)

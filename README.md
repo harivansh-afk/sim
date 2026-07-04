@@ -1,13 +1,13 @@
-# tui-notes
+# sim
 
 `bat` for rich documents: render Markdown and HTML natively in the terminal,
 with just enough interactivity to be useful. Built on OpenTUI's Zig-core
-renderer. Name TBD.
+renderer.
 
 ```
-bun src/cli.ts notes.md           # interactive pager
-bun src/cli.ts page.html          # html, converted and readonly
-bun src/cli.ts notes.md --plain   # plain text to stdout (also when piped)
+sim notes.md           # interactive pager
+sim page.html          # html, converted and readonly
+sim notes.md --plain   # plain text to stdout (also when piped)
 ```
 
 Rendering is concealed markdown: styled headings, bordered GFM tables,
@@ -60,6 +60,16 @@ src/
 
 Node is not a target (`node:ffi` is still experimental). Distribution path is
 `bun build --compile`.
+
+## Install (dev)
+
+```
+bun install
+ln -sfn "$PWD/src/cli.ts" ~/.local/bin/sim
+```
+
+`src/cli.ts` is executable with a `bun` shebang, so the symlink always runs
+the checkout: pull or edit, and the next `sim` invocation is the new build.
 
 ## Development
 
