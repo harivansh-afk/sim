@@ -46,6 +46,7 @@ export const palette = {
   statusFg: "#8b949e",
   statusAccent: "#e6edf3",
   selectionBg: "#1c2a3a",
+  diagramFg: "#7ee787",
   warn: "#d29922",
   ok: "#3fb950",
 } as const;

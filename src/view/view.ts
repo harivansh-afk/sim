@@ -1,11 +1,13 @@
 import {
   MarkdownRenderable,
   ScrollBoxRenderable,
+  TextRenderable,
   getTreeSitterClient,
   type RenderContext,
   type SyntaxStyle,
 } from "@opentui/core";
 import type { Block, BlockDelta, BlockId, Document } from "../document/types.ts";
+import { renderMermaid } from "./mermaid.ts";
 import { palette } from "./theme.ts";
 
 /**
@@ -18,7 +20,7 @@ export class DocumentView {
   readonly scroll: ScrollBoxRenderable;
   private readonly ctx: RenderContext;
   private readonly syntaxStyle: SyntaxStyle;
-  private rows = new Map<BlockId, MarkdownRenderable>();
+  private rows = new Map<BlockId, MarkdownRenderable | TextRenderable>();
   private highlighted: BlockId | null = null;
 
   constructor(ctx: RenderContext, syntaxStyle: SyntaxStyle) {
@@ -56,7 +58,9 @@ export class DocumentView {
     for (const { oldId, newId } of delta.replaced) {
       const row = this.rows.get(oldId);
       const block = next.block(newId);
-      if (!row || !block) {
+      // Specialized renderables (mermaid) do not content-swap; rebuild.
+      const mermaid = block !== undefined && block.node.type === "code" && block.node.lang === "mermaid";
+      if (!row || !block || !(row instanceof MarkdownRenderable) || mermaid) {
         this.mount(next);
         return;
       }
@@ -109,7 +113,24 @@ export class DocumentView {
     return Math.min(100, Math.round((this.scroll.scrollTop / max) * 100));
   }
 
-  private buildRow(block: Block): MarkdownRenderable {
+  private buildRow(block: Block): MarkdownRenderable | TextRenderable {
+    if (block.node.type === "code" && block.node.lang === "mermaid") {
+      const art = renderMermaid(block.node.value);
+      if (art) {
+        const note = art.note ? `\n(${art.note})` : "";
+        const row = new TextRenderable(this.ctx, {
+          id: `blk-${block.id}`,
+          content: `${art.text}${note}`,
+          fg: palette.diagramFg,
+          wrapMode: "none",
+          width: "100%",
+          marginBottom: 1,
+        });
+        this.rows.set(block.id, row);
+        return row;
+      }
+      // Unsupported mermaid: fall through to the highlighted code block.
+    }
     const row = new MarkdownRenderable(this.ctx, {
       id: `blk-${block.id}`,
       content: block.markdown,

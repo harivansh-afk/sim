@@ -11,18 +11,19 @@ only at the adapter boundary; everything downstream is format-blind.
 
 ```mermaid
 flowchart LR
-    MD[file.md] --> RA[remark-parse + gfm]
-    HTML[file.html] --> RB[rehype-parse -> rehype-remark]
-    RA --> DOC[Document: blocks with content-hash ids]
+    MD[.md file] --> RA[remark + gfm]
+    HTML[.html file] --> RB[rehype]
+    RA --> DOC[Document]
     RB --> DOC
-    DOC --> VIEW[DocumentView: one MarkdownRenderable per block]
-    VIEW --> ZIG[OpenTUI Zig core: layout, compositing, damage diff]
-    ZIG --> TTY[ANSI escapes]
+    DOC --> VIEW[DocumentView]
+    VIEW --> ZIG[Zig core]
+    ZIG --> TTY[ANSI]
 ```
 
-> Note: `@opentui/core` 0.4.3 renders mermaid fences as highlighted code;
-> native mermaid renderables landed upstream after this release. When the pin
-> moves, this diagram starts drawing itself. That is the test.
+> Note: sim renders mermaid *flowcharts* itself: a pure-TS layout engine in
+> `src/view/mermaid.ts` draws them with box characters via the block renderer
+> registry. Other diagram types (like the sequence diagram below) fall back
+> to highlighted code on purpose: fallback over wrong output.
 
 ## Layers
 

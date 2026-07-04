@@ -11,7 +11,9 @@ sim notes.md --plain   # plain text to stdout (also when piped)
 ```
 
 Rendering is concealed markdown: styled headings, bordered GFM tables,
-tree-sitter highlighted code blocks, no visible `**markers**`.
+tree-sitter highlighted code blocks, no visible `**markers**`. Mermaid
+flowcharts are laid out natively as box-drawing diagrams (pure-TS engine in
+`src/view/mermaid.ts`); other mermaid types fall back to highlighted code.
 
 ## Keys
 
