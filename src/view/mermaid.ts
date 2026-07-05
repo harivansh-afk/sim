@@ -215,11 +215,21 @@ class Canvas {
   }
 }
 
+/** Allocation state for edge corridors while drawing. */
+interface EdgeLanes {
+  side: number;
+  bus: number;
+  /** Elbow slots used per inter-column gap (LR), keyed by source rank. */
+  gaps: Map<number, number>;
+}
+
 interface Geometry {
   ranks: Node[][];
   height: number;
   mainWidth: number;
   laneCount: number;
+  /** Main-axis end of each rank (LR: column right edge; TD: rank bottom). */
+  colRights: number[];
 }
 
 /**
@@ -244,35 +254,47 @@ function placeNodes(
   for (let i = 0; i < ranks.length; i++) ranks[i] ??= [];
 
   const preds = new Map<string, Node[]>();
+  const succs = new Map<string, Node[]>();
   for (const e of edges) {
     const from = nodes.get(e.from);
     const to = nodes.get(e.to);
-    if (from && to && to.layer > from.layer) (preds.get(to.id) ?? preds.set(to.id, []).get(to.id))?.push(from);
+    if (from && to && to.layer > from.layer) {
+      (preds.get(to.id) ?? preds.set(to.id, []).get(to.id))?.push(from);
+      (succs.get(from.id) ?? succs.set(from.id, []).get(from.id))?.push(to);
+    }
   }
 
   // Cross-axis extent of a node: its width when vertical (TD), box height
   // when horizontal (LR).
   const extent = (n: Node) => (vertical ? n.w : BOX_H);
-  const crossGap = vertical ? gap : gap;
+  const crossGap = gap;
 
-  let minCross = Number.POSITIVE_INFINITY;
-  for (let r = 0; r < ranks.length; r++) {
-    const rank = ranks[r] ?? [];
-    let cursor = 0;
+  const sweepRank = (rank: Node[], neighbors: Map<string, Node[]>) => {
+    let cursor = Number.NEGATIVE_INFINITY;
     for (const node of rank) {
-      const sources = preds.get(node.id) ?? [];
-      let desired = cursor;
-      if (sources.length > 0) {
+      const others = neighbors.get(node.id) ?? [];
+      let desired = cursor === Number.NEGATIVE_INFINITY ? 0 : cursor;
+      if (others.length > 0) {
         let sum = 0;
-        for (const s of sources) sum += cross(s, vertical) + extent(s) / 2;
-        desired = Math.round(sum / sources.length - extent(node) / 2);
+        for (const o of others) sum += cross(o, vertical) + extent(o) / 2;
+        desired = Math.round(sum / others.length - extent(node) / 2);
+      } else if (cursor === Number.NEGATIVE_INFINITY) {
+        desired = cross(node, vertical);
       }
       const pos = Math.max(cursor, desired);
       setCross(node, vertical, pos);
       cursor = pos + extent(node) + crossGap;
-      minCross = Math.min(minCross, pos);
     }
-  }
+  };
+
+  // Dagre-style alternating sweeps: pull children under parents, then
+  // parents over children, then settle downward once more.
+  for (let r = 0; r < ranks.length; r++) sweepRank(ranks[r] ?? [], preds);
+  for (let r = ranks.length - 2; r >= 0; r--) sweepRank(ranks[r] ?? [], succs);
+  for (let r = 1; r < ranks.length; r++) sweepRank(ranks[r] ?? [], preds);
+
+  let minCross = Number.POSITIVE_INFINITY;
+  for (const node of nodes.values()) minCross = Math.min(minCross, cross(node, vertical));
   if (minCross === Number.POSITIVE_INFINITY) minCross = 0;
 
   // Main-axis positions per rank + normalize cross to start at 0. Horizontal
@@ -289,10 +311,12 @@ function placeNodes(
   }
   let main = 0;
   const rankMain: number[] = [];
+  const colRights: number[] = [];
   for (let r = 0; r < ranks.length; r++) {
     rankMain[r] = main;
     const rank = ranks[r] ?? [];
     const rankExtent = vertical ? BOX_H : Math.max(0, ...rank.map((n) => n.w));
+    colRights[r] = main + rankExtent;
     main += rankExtent + (vertical ? GAP : Math.max(gap, labelNeed[r] ?? 0));
   }
   let mainWidth = 0;
@@ -319,7 +343,7 @@ function placeNodes(
     const to = nodes.get(e.to);
     if (from && to && Math.abs(to.layer - from.layer) !== 1) laneCount++;
   }
-  return { ranks, height, mainWidth, laneCount };
+  return { ranks, height, mainWidth, laneCount, colRights };
 }
 
 function cross(n: Node, vertical: boolean): number {
@@ -345,7 +369,7 @@ function draw(
 
   for (const node of nodes.values()) drawBox(canvas, node);
 
-  const lanes = { side: 0, bus: 0 };
+  const lanes = { side: 0, bus: 0, gaps: new Map<number, number>() };
   for (const e of edges) {
     const from = nodes.get(e.from);
     const to = nodes.get(e.to);
@@ -389,59 +413,64 @@ function drawEdgeTD(
   to: Node,
   label: string | null,
   geo: Geometry,
-  lanes: { side: number; bus: number },
+  lanes: EdgeLanes,
 ): void {
-  const ucx = from.x + Math.floor(from.w / 2);
   const vcx = to.x + Math.floor(to.w / 2);
   const ucy = from.y + 2;
   const uBottom = from.y + BOX_H - 1;
   const span = to.layer - from.layer;
 
-  if (span === 1 && ucx === vcx) {
-    // Straight drop: tee out of the bottom border, arrow into the top.
-    c.put(ucx, uBottom, "\u252c");
-    c.vline(uBottom + 1, to.y - 2, ucx);
-    c.put(vcx, to.y - 1, "\u25bc");
-    if (label) embedLabel(c, label, ucx - Math.floor(label.length / 2), uBottom + 3, c.width - ucx);
+  // Overlap of the two boxes' border interiors decides straight vs jog:
+  // choosing a drop column inside BOTH borders can never draw through a box.
+  const overlapLo = Math.max(from.x + 1, to.x + 1);
+  const overlapHi = Math.min(from.x + from.w - 2, to.x + to.w - 2);
+
+  if (span === 1 && overlapLo <= overlapHi) {
+    const dropX = Math.max(overlapLo, Math.min(overlapHi, vcx));
+    c.put(dropX, uBottom, "\u252c");
+    c.vline(uBottom + 1, to.y - 2, dropX);
+    c.put(dropX, to.y - 1, "\u25bc");
+    if (label) embedLabel(c, label, dropX - Math.floor(label.length / 2), uBottom + 3, c.width);
     return;
   }
   if (span === 1) {
-    // Side exit toward the target column, then drop onto its top.
-    const right = vcx > ucx;
+    // Disjoint columns: side exit toward the target, drop onto its top.
+    // Disjointness guarantees the horizontal run is outside both boxes.
+    const right = to.x > from.x;
     const exitX = right ? from.x + from.w - 1 : from.x;
     c.put(exitX, ucy, right ? "\u251c" : "\u2524");
     c.hline(right ? exitX + 1 : vcx + 1, right ? vcx - 1 : exitX - 1, ucy);
     c.put(vcx, ucy, right ? "\u2510" : "\u250c");
     c.vline(ucy + 1, to.y - 2, vcx);
     c.put(vcx, to.y - 1, "\u25bc");
-    if (label) embedLabel(c, label, vcx - Math.floor(label.length / 2), Math.floor((ucy + to.y) / 2), c.width - vcx);
+    if (label) embedLabel(c, label, vcx - Math.floor(label.length / 2), Math.floor((ucy + to.y) / 2), c.width);
     return;
   }
+  // Long hops and back edges share the right-side lane corridor, which is
+  // outside every box by construction.
+  const laneX = Math.min(c.width - 1, geo.mainWidth + 1 + lanes.side * 2);
+  lanes.side++;
+  const exitX = from.x + from.w - 1;
+  c.put(exitX, ucy, "\u251c");
+  c.hline(exitX + 1, laneX - 1, ucy);
   if (span > 1) {
-    // Long hop: out the right border to a lane, down, back in from the right.
-    const laneX = Math.min(c.width - 1, geo.mainWidth + 1 + lanes.side * 2);
-    lanes.side++;
-    const exitX = from.x + from.w - 1;
+    // Down the lane, enter the target's right border.
     const vcy = to.y + 2;
-    c.put(exitX, ucy, "\u251c");
-    c.hline(exitX + 1, laneX - 1, ucy);
     c.put(laneX, ucy, "\u2510");
     c.vline(ucy + 1, vcy - 1, laneX);
     c.put(laneX, vcy, "\u2518");
     c.hline(to.x + to.w + 1, laneX - 1, vcy);
     c.put(to.x + to.w, vcy, "\u25c4");
-    if (label) embedLabel(c, label, laneX - label.length - 1, ucy - 1, label.length);
-    return;
+  } else {
+    // Back edge: up the lane, enter the target's right border from below.
+    const vcy = to.y + 2;
+    c.put(laneX, ucy, "\u2518");
+    c.vline(vcy + 1, ucy - 1, laneX);
+    c.put(laneX, vcy, "\u2510");
+    c.hline(to.x + to.w + 1, laneX - 1, vcy);
+    c.put(to.x + to.w, vcy, "\u25c4");
   }
-  // Back edge: side exit toward the target column, rise into its bottom.
-  const right = vcx >= ucx;
-  const exitX = right ? from.x + from.w - 1 : from.x;
-  c.put(exitX, ucy, right ? "\u251c" : "\u2524");
-  c.hline(right ? exitX + 1 : vcx + 1, right ? vcx - 1 : exitX - 1, ucy);
-  c.put(vcx, ucy, right ? "\u2518" : "\u2514");
-  c.vline(to.y + BOX_H + 1, ucy - 1, vcx);
-  c.put(vcx, to.y + BOX_H, "\u25b2");
-  if (label) embedLabel(c, label, vcx - Math.floor(label.length / 2), Math.floor((ucy + to.y + BOX_H) / 2), c.width - vcx);
+  if (label) embedLabel(c, label, exitX + 2, ucy - 1, laneX - exitX - 3);
 }
 
 function drawEdgeLR(
@@ -450,54 +479,54 @@ function drawEdgeLR(
   to: Node,
   label: string | null,
   geo: Geometry,
-  lanes: { side: number; bus: number },
+  lanes: EdgeLanes,
 ): void {
   const ucy = from.y + 2;
   const vcy = to.y + 2;
-  const ucx = from.x + Math.floor(from.w / 2);
-  const vcx = to.x + Math.floor(to.w / 2);
   const uRight = from.x + from.w - 1;
-  const uBottom = from.y + BOX_H - 1;
   const span = to.layer - from.layer;
 
-  if (span === 1 && ucy === vcy) {
-    // Straight: tee out of the right border, arrow into the left.
-    c.put(uRight, ucy, "\u251c");
-    c.hline(uRight + 1, to.x - 2, ucy);
-    c.put(to.x - 1, ucy, "\u25ba");
-    if (label) embedLabel(c, label, uRight + 2, ucy, to.x - uRight - 4);
+  // Overlap of side-border rows decides straight vs elbow.
+  const overlapLo = Math.max(from.y + 1, to.y + 1);
+  const overlapHi = Math.min(from.y + BOX_H - 2, to.y + BOX_H - 2);
+
+  if (span === 1 && overlapLo <= overlapHi) {
+    const rowY = Math.max(overlapLo, Math.min(overlapHi, vcy));
+    c.put(uRight, rowY, "\u251c");
+    c.hline(uRight + 1, to.x - 2, rowY);
+    c.put(to.x - 1, rowY, "\u25ba");
+    if (label) embedLabel(c, label, uRight + 2, rowY, to.x - uRight - 4);
     return;
   }
   if (span === 1) {
-    // Drop (or rise) out of the border toward the target row, then in.
-    const down = vcy > ucy;
-    c.put(ucx, down ? uBottom : from.y, down ? "\u252c" : "\u2534");
-    c.vline(down ? uBottom + 1 : vcy + 1, down ? vcy - 1 : from.y - 1, ucx);
-    c.put(ucx, vcy, down ? "\u2514" : "\u250c");
-    c.hline(ucx + 1, to.x - 2, vcy);
+    // Elbow inside the inter-column gap; verticals never enter a column.
+    const gapStart = geo.colRights[from.layer] ?? uRight + 1;
+    const used = lanes.gaps.get(from.layer) ?? 0;
+    lanes.gaps.set(from.layer, used + 1);
+    const xm = Math.max(uRight + 2, Math.min(gapStart + 1 + (used % 3) * 2, to.x - 2));
+    c.put(uRight, ucy, "\u251c");
+    c.hline(uRight + 1, xm - 1, ucy);
+    c.put(xm, ucy, vcy > ucy ? "\u2510" : "\u2518");
+    if (Math.abs(vcy - ucy) > 1) c.vline(Math.min(ucy, vcy) + 1, Math.max(ucy, vcy) - 1, xm);
+    c.put(xm, vcy, vcy > ucy ? "\u2514" : "\u250c");
+    c.hline(xm + 1, to.x - 2, vcy);
     c.put(to.x - 1, vcy, "\u25ba");
-    if (label) embedLabel(c, label, ucx + 2, vcy, to.x - ucx - 4);
+    if (label) embedLabel(c, label, xm + 2, vcy, to.x - xm - 4);
     return;
   }
-  if (span > 1) {
-    // Long hop: below everything, rise into the target's bottom border.
-    const busY = geo.height + 1 + lanes.bus * 2;
-    lanes.bus++;
-    c.put(ucx, uBottom, "\u252c");
-    c.vline(uBottom + 1, busY - 1, ucx);
-    c.put(ucx, busY, "\u2514");
-    c.hline(ucx + 1, vcx - 1, busY);
-    c.put(vcx, busY, "\u2518");
-    c.vline(to.y + BOX_H + 1, busY - 1, vcx);
-    c.put(vcx, to.y + BOX_H, "\u25b2");
-    if (label) embedLabel(c, label, ucx + 2, busY - 1, vcx - ucx - 3);
-    return;
-  }
-  // Back edge: drop out of the bottom, run left, enter the right border.
+  // Long hops and back edges travel the bus corridor below the diagram and
+  // rise into the target's bottom border.
+  const vcx = to.x + Math.floor(to.w / 2);
+  const ucx = from.x + Math.floor(from.w / 2);
+  const uBottom = from.y + BOX_H - 1;
+  const busY = geo.height + 1 + lanes.bus * 2;
+  lanes.bus++;
   c.put(ucx, uBottom, "\u252c");
-  c.vline(uBottom + 1, vcy - 1, ucx);
-  c.put(ucx, vcy, "\u2518");
-  c.hline(to.x + to.w + 1, ucx - 1, vcy);
-  c.put(to.x + to.w, vcy, "\u25c4");
-  if (label) embedLabel(c, label, to.x + to.w + 2, vcy - 1, ucx - to.x - to.w - 3);
+  c.vline(uBottom + 1, busY - 1, ucx);
+  c.put(ucx, busY, vcx > ucx ? "\u2514" : "\u2518");
+  c.hline(Math.min(ucx, vcx) + 1, Math.max(ucx, vcx) - 1, busY);
+  c.put(vcx, busY, vcx > ucx ? "\u2518" : "\u2514");
+  c.vline(to.y + BOX_H + 1, busY - 1, vcx);
+  c.put(vcx, to.y + BOX_H, "\u25b2");
+  if (label) embedLabel(c, label, Math.min(ucx, vcx) + 2, busY - 1, Math.abs(vcx - ucx) - 3);
 }
