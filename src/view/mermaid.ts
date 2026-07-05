@@ -1,28 +1,32 @@
 /**
- * Mermaid flowchart -> box-drawing ASCII. Pure text transform: no OpenTUI,
- * no DOM, no deps. Deliberately a subset:
+ * Mermaid flowchart -> ASCII, following the rendering conventions of real
+ * mermaid renderers (and mermaid-ascii, the reference terminal
+ * implementation):
  *
- *   flowchart LR / graph LR / TD / TB (non-LR directions render as LR
- *   with a note), nodes with [] () {} labels, chains of --> edges.
+ * - 5-row boxes with padding rows; [] square, () rounded
+ * - native layout in the declared direction (TD/TB, LR, and BT/RL via
+ *   reversed ranks); ranks aligned by predecessor barycenter so chains
+ *   run straight
+ * - edges anchor INTO borders as tees, arrowheads enter any side
+ * - edge labels embedded in the line
  *
- * Anything else (sequenceDiagram, gantt, unparseable lines, >24 nodes)
- * returns null and the caller falls back to a highlighted code block.
- * Fallback over wrong output, always.
+ * Unsupported diagram types return null and the caller falls back to a
+ * highlighted code block. Fallback over wrong output, always.
  */
 
 export interface MermaidArt {
   readonly text: string;
-  /** Set when the rendering took liberties (e.g. TD drawn as LR). */
   readonly note: string | null;
 }
+
+type Shape = "square" | "round";
 
 interface Node {
   readonly id: string;
   label: string;
-  /** Display label after width-fitting truncation. */
   disp: string;
+  shape: Shape;
   layer: number;
-  /** Filled during geometry. */
   x: number;
   y: number;
   w: number;
@@ -35,11 +39,10 @@ interface Edge {
 }
 
 const MAX_NODES = 24;
-const GAP = 6;
-const TIGHT_GAP = 4;
+const BOX_H = 5;
+const GAP = 5;
+const TIGHT_GAP = 3;
 const TIGHT_LABEL = 14;
-const BOX_H = 3;
-const ROW_GAP = 1;
 
 const HEADER_RE = /^(?:flowchart|graph)\s+(LR|RL|TD|TB|BT)?\s*$/i;
 const EDGE_SPLIT_RE = /\s*(?:-{2,3}>|={2,3}>|-\.+->)\s*(?:\|([^|]*)\|\s*)?/g;
@@ -67,18 +70,19 @@ export function renderMermaid(
   if (nodes.size === 0 || edges.length === 0) return null;
 
   assignLayers(nodes, edges);
-  // First pass at comfortable spacing; if it overflows the viewport, retry
-  // tight: smaller gaps and ellipsis-truncated labels.
-  let grid = layoutAndDraw(nodes, edges, GAP, Number.POSITIVE_INFINITY);
+  if (direction === "BT" || direction === "RL") {
+    let max = 0;
+    for (const n of nodes.values()) max = Math.max(max, n.layer);
+    for (const n of nodes.values()) n.layer = max - n.layer;
+  }
+  const vertical = direction === "TD" || direction === "TB" || direction === "BT";
+
+  let grid = draw(nodes, edges, vertical, GAP, Number.POSITIVE_INFINITY);
   if (grid && gridWidth(grid) > maxWidth) {
-    grid = layoutAndDraw(nodes, edges, TIGHT_GAP, TIGHT_LABEL);
+    grid = draw(nodes, edges, vertical, TIGHT_GAP, TIGHT_LABEL);
   }
   if (!grid) return null;
-
-  return {
-    text: grid,
-    note: direction === "LR" ? null : `direction ${direction} rendered left-to-right`,
-  };
+  return { text: grid, note: null };
 }
 
 function gridWidth(grid: string): number {
@@ -93,15 +97,26 @@ function parseChain(line: string, nodes: Map<string, Node>, edges: Edge[]): bool
   for (const m of line.matchAll(EDGE_SPLIT_RE)) labels.push(m[1]?.trim() || null);
   const parts = line.split(EDGE_SPLIT_RE).filter((_, i) => i % 2 === 0);
   if (parts.length === 1 && labels.length === 0) {
-    // standalone node declaration
-    return upsertNode(parts[0] ?? "", nodes) !== null;
+    for (const token of (parts[0] ?? "").split("&")) {
+      if (upsertNode(token, nodes) === null) return false;
+    }
+    return true;
   }
-  let prev: string | null = null;
+  // Each chain segment may be an `&` group: A --> B & C fans out.
+  let prev: string[] = [];
   for (let i = 0; i < parts.length; i++) {
-    const id = upsertNode(parts[i] ?? "", nodes);
-    if (!id) return false;
-    if (prev) edges.push({ from: prev, to: id, label: labels[i - 1] ?? null });
-    prev = id;
+    const group: string[] = [];
+    for (const token of (parts[i] ?? "").split("&")) {
+      const id = upsertNode(token, nodes);
+      if (!id) return false;
+      group.push(id);
+    }
+    for (const source of prev) {
+      for (const target of group) {
+        edges.push({ from: source, to: target, label: labels[i - 1] ?? null });
+      }
+    }
+    prev = group;
   }
   return true;
 }
@@ -111,11 +126,24 @@ function upsertNode(token: string, nodes: Map<string, Node>): string | null {
   if (!m || !m[1]) return null;
   const id = m[1];
   const label = m[3]?.trim() || undefined;
+  const shape: Shape = m[2]?.startsWith("(") ? "round" : "square";
   const existing = nodes.get(id);
   if (existing) {
-    if (label) existing.label = label;
+    if (label) {
+      existing.label = label;
+      existing.shape = shape;
+    }
   } else {
-    nodes.set(id, { id, label: label ?? id, disp: label ?? id, layer: 0, x: 0, y: 0, w: 0 });
+    nodes.set(id, {
+      id,
+      label: label ?? id,
+      disp: label ?? id,
+      shape: label ? shape : "square",
+      layer: 0,
+      x: 0,
+      y: 0,
+      w: 0,
+    });
   }
   return id;
 }
@@ -187,135 +215,289 @@ class Canvas {
   }
 }
 
-function layoutAndDraw(
+interface Geometry {
+  ranks: Node[][];
+  height: number;
+  mainWidth: number;
+  laneCount: number;
+}
+
+/**
+ * Place nodes: ranks along the main axis, siblings along the cross axis,
+ * cross positions pulled toward the barycenter of their predecessors so
+ * chains and symmetric fans come out straight.
+ */
+function placeNodes(
   nodes: Map<string, Node>,
   edges: Edge[],
+  vertical: boolean,
   gap: number,
   labelCap: number,
-): string | null {
-  const layers: Node[][] = [];
+): Geometry {
+  const ranks: Node[][] = [];
   for (const node of nodes.values()) {
     node.disp =
       node.label.length > labelCap ? `${node.label.slice(0, labelCap - 1)}\u2026` : node.label;
     node.w = node.disp.length + 4;
-    (layers[node.layer] ??= []).push(node);
+    (ranks[node.layer] ??= []).push(node);
   }
-  const colWidths = layers.map((col) => Math.max(...col.map((n) => n.w)));
-  const colHeights = layers.map((col) => col.length * (BOX_H + ROW_GAP) - ROW_GAP);
-  const height = Math.max(...colHeights);
+  for (let i = 0; i < ranks.length; i++) ranks[i] ??= [];
 
-  // A gap must fit the longest edge label routed through it.
-  const gapWidths = layers.map(() => gap);
+  const preds = new Map<string, Node[]>();
   for (const e of edges) {
     const from = nodes.get(e.from);
     const to = nodes.get(e.to);
-    if (e.label && from && to && to.layer === from.layer + 1) {
-      const idx = from.layer;
-      gapWidths[idx] = Math.max(gapWidths[idx] ?? gap, e.label.length + 5);
-    }
+    if (from && to && to.layer > from.layer) (preds.get(to.id) ?? preds.set(to.id, []).get(to.id))?.push(from);
   }
 
-  let x = 0;
-  let lastGap = 0;
-  const colRights: number[] = [];
-  for (let i = 0; i < layers.length; i++) {
-    const col = layers[i];
-    const colW = colWidths[i];
-    if (!col || colW === undefined) return null;
-    let y = Math.floor((height - (colHeights[i] ?? 0)) / 2);
-    for (const node of col) {
-      node.x = x + Math.floor((colW - node.w) / 2);
-      node.y = y;
-      y += BOX_H + ROW_GAP;
+  // Cross-axis extent of a node: its width when vertical (TD), box height
+  // when horizontal (LR).
+  const extent = (n: Node) => (vertical ? n.w : BOX_H);
+  const crossGap = vertical ? gap : gap;
+
+  let minCross = Number.POSITIVE_INFINITY;
+  for (let r = 0; r < ranks.length; r++) {
+    const rank = ranks[r] ?? [];
+    let cursor = 0;
+    for (const node of rank) {
+      const sources = preds.get(node.id) ?? [];
+      let desired = cursor;
+      if (sources.length > 0) {
+        let sum = 0;
+        for (const s of sources) sum += cross(s, vertical) + extent(s) / 2;
+        desired = Math.round(sum / sources.length - extent(node) / 2);
+      }
+      const pos = Math.max(cursor, desired);
+      setCross(node, vertical, pos);
+      cursor = pos + extent(node) + crossGap;
+      minCross = Math.min(minCross, pos);
     }
-    colRights[i] = x + colW;
-    lastGap = gapWidths[i] ?? gap;
-    x += colW + lastGap;
   }
-  const canvas = new Canvas(x - lastGap);
+  if (minCross === Number.POSITIVE_INFINITY) minCross = 0;
+
+  // Main-axis positions per rank + normalize cross to start at 0. Horizontal
+  // layouts widen a rank gap so inline edge labels fit on the line.
+  const labelNeed: number[] = [];
+  if (!vertical) {
+    for (const e of edges) {
+      const from = nodes.get(e.from);
+      const to = nodes.get(e.to);
+      if (e.label && from && to && to.layer === from.layer + 1) {
+        labelNeed[from.layer] = Math.max(labelNeed[from.layer] ?? 0, e.label.length + 4);
+      }
+    }
+  }
+  let main = 0;
+  const rankMain: number[] = [];
+  for (let r = 0; r < ranks.length; r++) {
+    rankMain[r] = main;
+    const rank = ranks[r] ?? [];
+    const rankExtent = vertical ? BOX_H : Math.max(0, ...rank.map((n) => n.w));
+    main += rankExtent + (vertical ? GAP : Math.max(gap, labelNeed[r] ?? 0));
+  }
+  let mainWidth = 0;
+  let height = 0;
+  for (const node of nodes.values()) {
+    const m = rankMain[node.layer] ?? 0;
+    if (vertical) {
+      node.x = cross(node, vertical) - minCross;
+      node.y = m;
+      // center box within rank main extent: rank extent is BOX_H, exact.
+    } else {
+      const rank = ranks[node.layer] ?? [];
+      const colW = Math.max(0, ...rank.map((n) => n.w));
+      node.x = m + Math.floor((colW - node.w) / 2);
+      node.y = cross(node, vertical) - minCross;
+    }
+    mainWidth = Math.max(mainWidth, node.x + node.w);
+    height = Math.max(height, node.y + BOX_H);
+  }
+
+  let laneCount = 0;
+  for (const e of edges) {
+    const from = nodes.get(e.from);
+    const to = nodes.get(e.to);
+    if (from && to && Math.abs(to.layer - from.layer) !== 1) laneCount++;
+  }
+  return { ranks, height, mainWidth, laneCount };
+}
+
+function cross(n: Node, vertical: boolean): number {
+  return vertical ? n.x : n.y;
+}
+
+function setCross(n: Node, vertical: boolean, v: number): void {
+  if (vertical) n.x = v;
+  else n.y = v;
+}
+
+function draw(
+  nodes: Map<string, Node>,
+  edges: Edge[],
+  vertical: boolean,
+  gap: number,
+  labelCap: number,
+): string | null {
+  // Horizontal layouts widen gaps that carry inline edge labels.
+  const geo = placeNodes(nodes, edges, vertical, gap, labelCap);
+  const width = geo.mainWidth + (vertical ? 2 + geo.laneCount * 2 : 0) + 1;
+  const canvas = new Canvas(Math.max(width, geo.mainWidth + 1));
 
   for (const node of nodes.values()) drawBox(canvas, node);
 
-  const gapUse = new Map<number, number>();
+  const lanes = { side: 0, bus: 0 };
   for (const e of edges) {
     const from = nodes.get(e.from);
     const to = nodes.get(e.to);
-    if (!from || !to || to.layer <= from.layer) continue; // drop back-edges
-    drawEdge(canvas, from, to, e.label, gapUse, height, colRights);
+    if (!from || !to || from === to) continue;
+    if (vertical) drawEdgeTD(canvas, from, to, e.label, geo, lanes);
+    else drawEdgeLR(canvas, from, to, e.label, geo, lanes);
   }
   return canvas.render();
 }
 
 function drawBox(c: Canvas, n: Node): void {
   const { x, y, w } = n;
-  c.put(x, y, "\u256d");
+  const [tl, tr, bl, br] =
+    n.shape === "round"
+      ? ["\u256d", "\u256e", "\u2570", "\u256f"]
+      : ["\u250c", "\u2510", "\u2514", "\u2518"];
+  c.put(x, y, tl);
   c.hline(x + 1, x + w - 2, y);
-  c.put(x + w - 1, y, "\u256e");
-  c.put(x, y + 1, "\u2502");
-  c.text(x + 2, y + 1, n.disp);
-  c.put(x + w - 1, y + 1, "\u2502");
-  c.put(x, y + 2, "\u2570");
-  c.hline(x + 1, x + w - 2, y + 2);
-  c.put(x + w - 1, y + 2, "\u256f");
+  c.put(x + w - 1, y, tr);
+  for (const row of [1, 2, 3]) {
+    c.put(x, y + row, "\u2502");
+    c.put(x + w - 1, y + row, "\u2502");
+  }
+  c.text(x + 2, y + 2, n.disp);
+  c.put(x, y + 4, bl);
+  c.hline(x + 1, x + w - 2, y + 4);
+  c.put(x + w - 1, y + 4, br);
 }
 
-function drawEdge(
+/** Embed a label into a run of line characters, mermaid-ascii style. */
+function embedLabel(c: Canvas, label: string, x: number, y: number, maxLen: number): void {
+  const startX = Math.max(0, x);
+  const len = Math.min(maxLen, c.width - startX);
+  if (len <= 0 || y < 0) return;
+  c.text(startX, y, label.length > len ? `${label.slice(0, Math.max(1, len - 1))}\u2026` : label);
+}
+
+function drawEdgeTD(
   c: Canvas,
   from: Node,
   to: Node,
   label: string | null,
-  gapUse: Map<number, number>,
-  height: number,
-  colRights: number[],
+  geo: Geometry,
+  lanes: { side: number; bus: number },
 ): void {
-  const sy = from.y + 1;
-  const ty = to.y + 1;
-  const sx = from.x + from.w; // first char right of the source box
-  const tx = to.x - 1; // last char left of the target box
+  const ucx = from.x + Math.floor(from.w / 2);
+  const vcx = to.x + Math.floor(to.w / 2);
+  const ucy = from.y + 2;
+  const uBottom = from.y + BOX_H - 1;
+  const span = to.layer - from.layer;
 
-  // Verticals may only live in the inter-column gap, never inside a column
-  // where a narrower sibling box would be pierced.
-  const gapStart = colRights[from.layer] ?? sx;
-  if (to.layer === from.layer + 1) {
-    // Single-gap elbow: out, turn, in.
-    const used = gapUse.get(from.layer) ?? 0;
-    gapUse.set(from.layer, used + 1);
-    const xm = Math.min(gapStart + 1 + used * 2, tx - 2);
-    if (sy === ty) {
-      c.hline(sx, tx - 1, sy);
-    } else {
-      c.hline(sx, xm - 1, sy);
-      c.put(xm, sy, ty > sy ? "\u2510" : "\u2518");
-      if (Math.abs(ty - sy) > 1) c.vline(Math.min(sy, ty) + 1, Math.max(sy, ty) - 1, xm);
-      c.put(xm, ty, ty > sy ? "\u2514" : "\u250c");
-      c.hline(xm + 1, tx - 1, ty);
-    }
-    c.put(tx, ty, "\u25ba");
-    if (label) {
-      // Above the incoming segment, clipped so it never touches a box wall.
-      const maxLen = tx - xm - 1;
-      if (maxLen > 0) c.text(xm + 1, (sy === ty ? sy : ty) - 1, label.slice(0, maxLen));
-    }
+  if (span === 1 && ucx === vcx) {
+    // Straight drop: tee out of the bottom border, arrow into the top.
+    c.put(ucx, uBottom, "\u252c");
+    c.vline(uBottom + 1, to.y - 2, ucx);
+    c.put(vcx, to.y - 1, "\u25bc");
+    if (label) embedLabel(c, label, ucx - Math.floor(label.length / 2), uBottom + 3, c.width - ucx);
     return;
   }
-
-  // Multi-layer span: drop to a bus row below the diagram, travel, rise.
-  const bus = height + 1 + (gapUse.get(-1) ?? 0);
-  gapUse.set(-1, (gapUse.get(-1) ?? 0) + 1);
-  const x1 = Math.max(sx + 1, (colRights[from.layer] ?? sx) + 1);
-  const x2 = tx - 2;
-  c.hline(sx, x1 - 1, sy);
-  c.put(x1, sy, "\u2510");
-  c.vline(sy + 1, bus - 1, x1);
-  c.put(x1, bus, "\u2514");
-  c.hline(x1 + 1, x2 - 1, bus);
-  c.put(x2, bus, "\u2518");
-  c.vline(ty + 1, bus - 1, x2);
-  c.put(x2, ty, "\u250c");
-  c.hline(x2 + 1, tx - 1, ty);
-  c.put(tx, ty, "\u25ba");
-  if (label) {
-    const maxLen = x2 - x1 - 2;
-    if (maxLen > 0) c.text(x1 + 2, bus - 1, label.slice(0, maxLen));
+  if (span === 1) {
+    // Side exit toward the target column, then drop onto its top.
+    const right = vcx > ucx;
+    const exitX = right ? from.x + from.w - 1 : from.x;
+    c.put(exitX, ucy, right ? "\u251c" : "\u2524");
+    c.hline(right ? exitX + 1 : vcx + 1, right ? vcx - 1 : exitX - 1, ucy);
+    c.put(vcx, ucy, right ? "\u2510" : "\u250c");
+    c.vline(ucy + 1, to.y - 2, vcx);
+    c.put(vcx, to.y - 1, "\u25bc");
+    if (label) embedLabel(c, label, vcx - Math.floor(label.length / 2), Math.floor((ucy + to.y) / 2), c.width - vcx);
+    return;
   }
+  if (span > 1) {
+    // Long hop: out the right border to a lane, down, back in from the right.
+    const laneX = Math.min(c.width - 1, geo.mainWidth + 1 + lanes.side * 2);
+    lanes.side++;
+    const exitX = from.x + from.w - 1;
+    const vcy = to.y + 2;
+    c.put(exitX, ucy, "\u251c");
+    c.hline(exitX + 1, laneX - 1, ucy);
+    c.put(laneX, ucy, "\u2510");
+    c.vline(ucy + 1, vcy - 1, laneX);
+    c.put(laneX, vcy, "\u2518");
+    c.hline(to.x + to.w + 1, laneX - 1, vcy);
+    c.put(to.x + to.w, vcy, "\u25c4");
+    if (label) embedLabel(c, label, laneX - label.length - 1, ucy - 1, label.length);
+    return;
+  }
+  // Back edge: side exit toward the target column, rise into its bottom.
+  const right = vcx >= ucx;
+  const exitX = right ? from.x + from.w - 1 : from.x;
+  c.put(exitX, ucy, right ? "\u251c" : "\u2524");
+  c.hline(right ? exitX + 1 : vcx + 1, right ? vcx - 1 : exitX - 1, ucy);
+  c.put(vcx, ucy, right ? "\u2518" : "\u2514");
+  c.vline(to.y + BOX_H + 1, ucy - 1, vcx);
+  c.put(vcx, to.y + BOX_H, "\u25b2");
+  if (label) embedLabel(c, label, vcx - Math.floor(label.length / 2), Math.floor((ucy + to.y + BOX_H) / 2), c.width - vcx);
+}
+
+function drawEdgeLR(
+  c: Canvas,
+  from: Node,
+  to: Node,
+  label: string | null,
+  geo: Geometry,
+  lanes: { side: number; bus: number },
+): void {
+  const ucy = from.y + 2;
+  const vcy = to.y + 2;
+  const ucx = from.x + Math.floor(from.w / 2);
+  const vcx = to.x + Math.floor(to.w / 2);
+  const uRight = from.x + from.w - 1;
+  const uBottom = from.y + BOX_H - 1;
+  const span = to.layer - from.layer;
+
+  if (span === 1 && ucy === vcy) {
+    // Straight: tee out of the right border, arrow into the left.
+    c.put(uRight, ucy, "\u251c");
+    c.hline(uRight + 1, to.x - 2, ucy);
+    c.put(to.x - 1, ucy, "\u25ba");
+    if (label) embedLabel(c, label, uRight + 2, ucy, to.x - uRight - 4);
+    return;
+  }
+  if (span === 1) {
+    // Drop (or rise) out of the border toward the target row, then in.
+    const down = vcy > ucy;
+    c.put(ucx, down ? uBottom : from.y, down ? "\u252c" : "\u2534");
+    c.vline(down ? uBottom + 1 : vcy + 1, down ? vcy - 1 : from.y - 1, ucx);
+    c.put(ucx, vcy, down ? "\u2514" : "\u250c");
+    c.hline(ucx + 1, to.x - 2, vcy);
+    c.put(to.x - 1, vcy, "\u25ba");
+    if (label) embedLabel(c, label, ucx + 2, vcy, to.x - ucx - 4);
+    return;
+  }
+  if (span > 1) {
+    // Long hop: below everything, rise into the target's bottom border.
+    const busY = geo.height + 1 + lanes.bus * 2;
+    lanes.bus++;
+    c.put(ucx, uBottom, "\u252c");
+    c.vline(uBottom + 1, busY - 1, ucx);
+    c.put(ucx, busY, "\u2514");
+    c.hline(ucx + 1, vcx - 1, busY);
+    c.put(vcx, busY, "\u2518");
+    c.vline(to.y + BOX_H + 1, busY - 1, vcx);
+    c.put(vcx, to.y + BOX_H, "\u25b2");
+    if (label) embedLabel(c, label, ucx + 2, busY - 1, vcx - ucx - 3);
+    return;
+  }
+  // Back edge: drop out of the bottom, run left, enter the right border.
+  c.put(ucx, uBottom, "\u252c");
+  c.vline(uBottom + 1, vcy - 1, ucx);
+  c.put(ucx, vcy, "\u2518");
+  c.hline(to.x + to.w + 1, ucx - 1, vcy);
+  c.put(to.x + to.w, vcy, "\u25c4");
+  if (label) embedLabel(c, label, to.x + to.w + 2, vcy - 1, ucx - to.x - to.w - 3);
 }

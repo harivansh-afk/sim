@@ -29,8 +29,8 @@ function countChar(text: string, wanted: string): number {
 }
 
 function countBoxCorners(text: string): number {
-  // Boxes use rounded corners; square corners belong to edge routing.
-  const corners: Record<string, true> = { "╭": true, "╮": true, "╰": true, "╯": true };
+  // [] boxes draw square corners, mermaid-ascii style.
+  const corners: Record<string, true> = { "┌": true, "┐": true, "└": true, "┘": true };
   let count = 0;
   for (const char of text) {
     if (corners[char] === true) {
@@ -119,12 +119,14 @@ describe("renderMermaid", () => {
     expect(renderedLineCount(span.text)).toBeGreaterThan(renderedLineCount(singleChain.text));
   });
 
-  test("non-left-to-right flowcharts report the rendered direction in a note", () => {
+  test("top-down flowcharts render natively with downward arrows and no note", () => {
     const topDown = renderOrThrow("graph TD\nA --> B");
     const leftToRight = renderOrThrow("flowchart LR\nA --> B");
 
-    expect(topDown.note).toContain("TD");
+    expect(topDown.note).toBeNull();
+    expect(countChar(topDown.text, "▼")).toBe(1);
     expect(leftToRight.note).toBeNull();
+    expect(countChar(leftToRight.text, "►")).toBe(1);
   });
 
   test("later references reuse an earlier node label without duplicating the box", () => {

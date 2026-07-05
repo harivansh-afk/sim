@@ -1,5 +1,6 @@
 import {
   MarkdownRenderable,
+  Renderable,
   ScrollBoxRenderable,
   StyledText,
   TextRenderable,
@@ -11,19 +12,26 @@ import {
 } from "@opentui/core";
 import type { Block, BlockDelta, BlockId, Document } from "../document/types.ts";
 import { renderMermaid } from "./mermaid.ts";
-import { MEASURE, palette } from "./theme.ts";
+import { palette } from "./theme.ts";
 
 /**
- * Owns the scrollable rendering of one Document: one MarkdownRenderable per
- * top-level block, keyed by block id. Hides reconciliation (surgical content
- * swaps for in-place edits, full rebuild for structural changes), selection
- * highlight, and scroll bookkeeping. Never touches disk or mdast internals.
+ * Owns the scrollable rendering of one Document.
+ *
+ * Renderable economy is the point: consecutive ordinary blocks coalesce into
+ * ONE MarkdownRenderable (one marked parse, one tree-sitter session, one yoga
+ * subtree per run), because only interactive blocks need identity. Special
+ * blocks - task lists (selection + toggle) and mermaid diagrams (custom
+ * drawing) - get their own keyed renderables. Viewport culling keeps
+ * off-screen rows out of the paint path while scrolling.
  */
 export class DocumentView {
   readonly scroll: ScrollBoxRenderable;
   private readonly ctx: CliRenderer;
   private readonly syntaxStyle: SyntaxStyle;
-  private rows = new Map<BlockId, MarkdownRenderable | TextRenderable>();
+  /** All mounted rows, in order, for teardown. */
+  private mounted: Renderable[] = [];
+  /** Interactive rows only, keyed by block id (tasks, diagrams). */
+  private byBlock = new Map<BlockId, MarkdownRenderable | TextRenderable>();
   private highlighted: BlockId | null = null;
 
   constructor(ctx: CliRenderer, syntaxStyle: SyntaxStyle) {
@@ -35,23 +43,69 @@ export class DocumentView {
       scrollY: true,
       scrollX: false,
       paddingX: 2,
+      viewportCulling: true,
     });
   }
 
   mount(doc: Document): void {
-    for (const row of this.rows.values()) {
+    for (const row of this.mounted) {
       this.scroll.remove(row);
       row.destroy();
     }
-    this.rows.clear();
+    this.mounted = [];
+    this.byBlock.clear();
     this.highlighted = null;
-    for (const block of doc.blocks) this.scroll.add(this.buildRow(block));
+
+    const taskBlocks = new Set<BlockId>();
+    for (const task of doc.tasks()) taskBlocks.add(task.blockId);
+
+    let runStart: Block | null = null;
+    let runEnd: Block | null = null;
+    const flushRun = () => {
+      if (!runStart || !runEnd) return;
+      this.addRow(
+        this.markdownRow(`run-${runStart.id}`, doc.text.slice(runStart.span.start, runEnd.span.end)),
+      );
+      runStart = null;
+      runEnd = null;
+    };
+
+    for (const block of doc.blocks) {
+      const mermaid = block.node.type === "code" && block.node.lang === "mermaid";
+      const interactive = taskBlocks.has(block.id);
+      if (!mermaid && !interactive) {
+        runStart ??= block;
+        runEnd = block;
+        continue;
+      }
+      flushRun();
+      if (mermaid && block.node.type === "code") {
+        const art = renderMermaid(block.node.value, Math.max(40, this.ctx.terminalWidth - 6));
+        if (art) {
+          const row = new TextRenderable(this.ctx, {
+            id: `blk-${block.id}`,
+            content: diagramStyled(art.text),
+            wrapMode: "none",
+            width: "auto",
+            alignSelf: "center",
+            marginY: 1,
+          });
+          this.byBlock.set(block.id, row);
+          this.addRow(row);
+          continue;
+        }
+        // Unsupported mermaid: render as the highlighted code block it is.
+      }
+      const row = this.markdownRow(`blk-${block.id}`, block.markdown);
+      this.byBlock.set(block.id, row);
+      this.addRow(row);
+    }
+    flushRun();
   }
 
   /**
-   * Reconcile after an edit. Deltas with unchanged block count map old ids to
-   * new ids in place; structural deltas fall back to a full rebuild (correct
-   * first, clever later).
+   * Reconcile after an edit. Task toggles hit interactive rows and swap
+   * content surgically; anything else (or a structural change) remounts.
    */
   applyEdit(next: Document, delta: BlockDelta): void {
     if (delta.structural) {
@@ -59,30 +113,28 @@ export class DocumentView {
       return;
     }
     for (const { oldId, newId } of delta.replaced) {
-      const row = this.rows.get(oldId);
+      const row = this.byBlock.get(oldId);
       const block = next.block(newId);
-      // Specialized renderables (mermaid) do not content-swap; rebuild.
-      const mermaid = block !== undefined && block.node.type === "code" && block.node.lang === "mermaid";
-      if (!row || !block || !(row instanceof MarkdownRenderable) || mermaid) {
+      if (!row || !block || !(row instanceof MarkdownRenderable)) {
         this.mount(next);
         return;
       }
       row.content = block.markdown;
-      this.rows.delete(oldId);
-      this.rows.set(newId, row);
+      this.byBlock.delete(oldId);
+      this.byBlock.set(newId, row);
       if (this.highlighted === oldId) this.highlighted = newId;
     }
   }
 
-  /** Move the selection highlight to a block (or clear it with null). */
+  /** Move the selection highlight to an interactive block (null clears). */
   highlight(id: BlockId | null): void {
     if (this.highlighted && this.highlighted !== id) {
-      const prev = this.rows.get(this.highlighted);
+      const prev = this.byBlock.get(this.highlighted);
       if (prev) prev.bg = undefined;
     }
     this.highlighted = id;
     if (id) {
-      const row = this.rows.get(id);
+      const row = this.byBlock.get(id);
       if (row) {
         row.bg = palette.selectionBg;
         this.scroll.scrollChildIntoView(row.id);
@@ -116,44 +168,31 @@ export class DocumentView {
     return Math.min(100, Math.round((this.scroll.scrollTop / max) * 100));
   }
 
-  private buildRow(block: Block): MarkdownRenderable | TextRenderable {
-    if (block.node.type === "code" && block.node.lang === "mermaid") {
-      const avail = Math.max(40, Math.min(MEASURE, this.ctx.terminalWidth - 8));
-      const art = renderMermaid(block.node.value, avail);
-      if (art) {
-        const row = new TextRenderable(this.ctx, {
-          id: `blk-${block.id}`,
-          content: diagramStyled(art.text, art.note),
-          wrapMode: "none",
-          width: "auto",
-          alignSelf: "center",
-          marginBottom: 1,
-        });
-        this.rows.set(block.id, row);
-        return row;
-      }
-      // Unsupported mermaid: fall through to the highlighted code block.
-    }
-    const row = new MarkdownRenderable(this.ctx, {
-      id: `blk-${block.id}`,
-      content: block.markdown,
+  private addRow(row: Renderable): void {
+    this.mounted.push(row);
+    this.scroll.add(row);
+  }
+
+  private markdownRow(id: string, content: string): MarkdownRenderable {
+    return new MarkdownRenderable(this.ctx, {
+      id,
+      content,
       syntaxStyle: this.syntaxStyle,
       treeSitterClient: getTreeSitterClient(),
       conceal: true,
       width: "100%",
-      maxWidth: MEASURE,
-      alignSelf: "center",
       marginBottom: 1,
     });
-    this.rows.set(block.id, row);
-    return row;
   }
 }
 
-const STRUCTURE_CHARS = new Set("\u2500\u2502\u256d\u256e\u2570\u256f\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u25ba");
+
+const STRUCTURE_CHARS = new Set(
+  "\u2500\u2502\u256d\u256e\u2570\u256f\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u25ba\u25c4\u25b2\u25bc",
+);
 
 /** Two-tone diagram: structure in muted gray, labels in body color. */
-function diagramStyled(body: string, note: string | null): StyledText {
+function diagramStyled(body: string): StyledText {
   const chunks: TextChunk[] = [];
   let run = "";
   let runIsStructure = false;
@@ -170,6 +209,5 @@ function diagramStyled(body: string, note: string | null): StyledText {
     run += ch;
   }
   flush();
-  if (note) chunks.push(fg(palette.muted)(`\n\n${note}`));
   return new StyledText(chunks);
 }
