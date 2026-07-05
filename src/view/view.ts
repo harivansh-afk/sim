@@ -1,14 +1,17 @@
 import {
   MarkdownRenderable,
   ScrollBoxRenderable,
+  StyledText,
   TextRenderable,
+  fg,
   getTreeSitterClient,
-  type RenderContext,
+  type CliRenderer,
   type SyntaxStyle,
+  type TextChunk,
 } from "@opentui/core";
 import type { Block, BlockDelta, BlockId, Document } from "../document/types.ts";
 import { renderMermaid } from "./mermaid.ts";
-import { palette } from "./theme.ts";
+import { MEASURE, palette } from "./theme.ts";
 
 /**
  * Owns the scrollable rendering of one Document: one MarkdownRenderable per
@@ -18,12 +21,12 @@ import { palette } from "./theme.ts";
  */
 export class DocumentView {
   readonly scroll: ScrollBoxRenderable;
-  private readonly ctx: RenderContext;
+  private readonly ctx: CliRenderer;
   private readonly syntaxStyle: SyntaxStyle;
   private rows = new Map<BlockId, MarkdownRenderable | TextRenderable>();
   private highlighted: BlockId | null = null;
 
-  constructor(ctx: RenderContext, syntaxStyle: SyntaxStyle) {
+  constructor(ctx: CliRenderer, syntaxStyle: SyntaxStyle) {
     this.ctx = ctx;
     this.syntaxStyle = syntaxStyle;
     this.scroll = new ScrollBoxRenderable(ctx, {
@@ -31,7 +34,7 @@ export class DocumentView {
       width: "100%",
       scrollY: true,
       scrollX: false,
-      paddingX: 1,
+      paddingX: 2,
     });
   }
 
@@ -115,15 +118,15 @@ export class DocumentView {
 
   private buildRow(block: Block): MarkdownRenderable | TextRenderable {
     if (block.node.type === "code" && block.node.lang === "mermaid") {
-      const art = renderMermaid(block.node.value);
+      const avail = Math.max(40, Math.min(MEASURE, this.ctx.terminalWidth - 8));
+      const art = renderMermaid(block.node.value, avail);
       if (art) {
-        const note = art.note ? `\n(${art.note})` : "";
         const row = new TextRenderable(this.ctx, {
           id: `blk-${block.id}`,
-          content: `${art.text}${note}`,
-          fg: palette.diagramFg,
+          content: diagramStyled(art.text, art.note),
           wrapMode: "none",
-          width: "100%",
+          width: "auto",
+          alignSelf: "center",
           marginBottom: 1,
         });
         this.rows.set(block.id, row);
@@ -138,9 +141,35 @@ export class DocumentView {
       treeSitterClient: getTreeSitterClient(),
       conceal: true,
       width: "100%",
+      maxWidth: MEASURE,
+      alignSelf: "center",
       marginBottom: 1,
     });
     this.rows.set(block.id, row);
     return row;
   }
+}
+
+const STRUCTURE_CHARS = new Set("\u2500\u2502\u256d\u256e\u2570\u256f\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u25ba");
+
+/** Two-tone diagram: structure in muted gray, labels in body color. */
+function diagramStyled(body: string, note: string | null): StyledText {
+  const chunks: TextChunk[] = [];
+  let run = "";
+  let runIsStructure = false;
+  const flush = () => {
+    if (run.length > 0) chunks.push(fg(runIsStructure ? palette.faint : palette.text)(run));
+    run = "";
+  };
+  for (const ch of body) {
+    const isStructure = STRUCTURE_CHARS.has(ch);
+    if (run.length > 0 && isStructure !== runIsStructure && ch !== " " && run.trim().length > 0) {
+      flush();
+    }
+    if (run.length === 0) runIsStructure = isStructure;
+    run += ch;
+  }
+  flush();
+  if (note) chunks.push(fg(palette.muted)(`\n\n${note}`));
+  return new StyledText(chunks);
 }

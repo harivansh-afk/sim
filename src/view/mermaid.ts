@@ -19,6 +19,8 @@ export interface MermaidArt {
 interface Node {
   readonly id: string;
   label: string;
+  /** Display label after width-fitting truncation. */
+  disp: string;
   layer: number;
   /** Filled during geometry. */
   x: number;
@@ -34,6 +36,8 @@ interface Edge {
 
 const MAX_NODES = 24;
 const GAP = 6;
+const TIGHT_GAP = 4;
+const TIGHT_LABEL = 14;
 const BOX_H = 3;
 const ROW_GAP = 1;
 
@@ -41,7 +45,10 @@ const HEADER_RE = /^(?:flowchart|graph)\s+(LR|RL|TD|TB|BT)?\s*$/i;
 const EDGE_SPLIT_RE = /\s*(?:-{2,3}>|={2,3}>|-\.+->)\s*(?:\|([^|]*)\|\s*)?/g;
 const NODE_RE = /^(\w[\w.-]*)\s*(?:(\[\[|\[\(|\(\(|\(\[|\{\{|\[|\(|\{)\s*"?(.*?)"?\s*(\]\]|\)\]|\)\)|\]\)|\}\}|\]|\)|\}))?$/;
 
-export function renderMermaid(source: string): MermaidArt | null {
+export function renderMermaid(
+  source: string,
+  maxWidth: number = Number.POSITIVE_INFINITY,
+): MermaidArt | null {
   const lines = source
     .split("\n")
     .map((l) => l.trim())
@@ -60,13 +67,24 @@ export function renderMermaid(source: string): MermaidArt | null {
   if (nodes.size === 0 || edges.length === 0) return null;
 
   assignLayers(nodes, edges);
-  const grid = layoutAndDraw(nodes, edges);
+  // First pass at comfortable spacing; if it overflows the viewport, retry
+  // tight: smaller gaps and ellipsis-truncated labels.
+  let grid = layoutAndDraw(nodes, edges, GAP, Number.POSITIVE_INFINITY);
+  if (grid && gridWidth(grid) > maxWidth) {
+    grid = layoutAndDraw(nodes, edges, TIGHT_GAP, TIGHT_LABEL);
+  }
   if (!grid) return null;
 
   return {
     text: grid,
     note: direction === "LR" ? null : `direction ${direction} rendered left-to-right`,
   };
+}
+
+function gridWidth(grid: string): number {
+  let max = 0;
+  for (const line of grid.split("\n")) max = Math.max(max, line.length);
+  return max;
 }
 
 /** Parse one `A[x] --> B --> C` chain; returns false on syntax we refuse. */
@@ -97,7 +115,7 @@ function upsertNode(token: string, nodes: Map<string, Node>): string | null {
   if (existing) {
     if (label) existing.label = label;
   } else {
-    nodes.set(id, { id, label: label ?? id, layer: 0, x: 0, y: 0, w: 0 });
+    nodes.set(id, { id, label: label ?? id, disp: label ?? id, layer: 0, x: 0, y: 0, w: 0 });
   }
   return id;
 }
@@ -169,10 +187,17 @@ class Canvas {
   }
 }
 
-function layoutAndDraw(nodes: Map<string, Node>, edges: Edge[]): string | null {
+function layoutAndDraw(
+  nodes: Map<string, Node>,
+  edges: Edge[],
+  gap: number,
+  labelCap: number,
+): string | null {
   const layers: Node[][] = [];
   for (const node of nodes.values()) {
-    node.w = node.label.length + 4;
+    node.disp =
+      node.label.length > labelCap ? `${node.label.slice(0, labelCap - 1)}\u2026` : node.label;
+    node.w = node.disp.length + 4;
     (layers[node.layer] ??= []).push(node);
   }
   const colWidths = layers.map((col) => Math.max(...col.map((n) => n.w)));
@@ -180,18 +205,19 @@ function layoutAndDraw(nodes: Map<string, Node>, edges: Edge[]): string | null {
   const height = Math.max(...colHeights);
 
   // A gap must fit the longest edge label routed through it.
-  const gapWidths = layers.map(() => GAP);
+  const gapWidths = layers.map(() => gap);
   for (const e of edges) {
     const from = nodes.get(e.from);
     const to = nodes.get(e.to);
     if (e.label && from && to && to.layer === from.layer + 1) {
       const idx = from.layer;
-      gapWidths[idx] = Math.max(gapWidths[idx] ?? GAP, e.label.length + 5);
+      gapWidths[idx] = Math.max(gapWidths[idx] ?? gap, e.label.length + 5);
     }
   }
 
   let x = 0;
   let lastGap = 0;
+  const colRights: number[] = [];
   for (let i = 0; i < layers.length; i++) {
     const col = layers[i];
     const colW = colWidths[i];
@@ -202,7 +228,8 @@ function layoutAndDraw(nodes: Map<string, Node>, edges: Edge[]): string | null {
       node.y = y;
       y += BOX_H + ROW_GAP;
     }
-    lastGap = gapWidths[i] ?? GAP;
+    colRights[i] = x + colW;
+    lastGap = gapWidths[i] ?? gap;
     x += colW + lastGap;
   }
   const canvas = new Canvas(x - lastGap);
@@ -214,22 +241,22 @@ function layoutAndDraw(nodes: Map<string, Node>, edges: Edge[]): string | null {
     const from = nodes.get(e.from);
     const to = nodes.get(e.to);
     if (!from || !to || to.layer <= from.layer) continue; // drop back-edges
-    drawEdge(canvas, from, to, e.label, gapUse, height);
+    drawEdge(canvas, from, to, e.label, gapUse, height, colRights);
   }
   return canvas.render();
 }
 
 function drawBox(c: Canvas, n: Node): void {
   const { x, y, w } = n;
-  c.put(x, y, "\u250c");
+  c.put(x, y, "\u256d");
   c.hline(x + 1, x + w - 2, y);
-  c.put(x + w - 1, y, "\u2510");
+  c.put(x + w - 1, y, "\u256e");
   c.put(x, y + 1, "\u2502");
-  c.text(x + 2, y + 1, n.label);
+  c.text(x + 2, y + 1, n.disp);
   c.put(x + w - 1, y + 1, "\u2502");
-  c.put(x, y + 2, "\u2514");
+  c.put(x, y + 2, "\u2570");
   c.hline(x + 1, x + w - 2, y + 2);
-  c.put(x + w - 1, y + 2, "\u2518");
+  c.put(x + w - 1, y + 2, "\u256f");
 }
 
 function drawEdge(
@@ -239,17 +266,21 @@ function drawEdge(
   label: string | null,
   gapUse: Map<number, number>,
   height: number,
+  colRights: number[],
 ): void {
   const sy = from.y + 1;
   const ty = to.y + 1;
   const sx = from.x + from.w; // first char right of the source box
   const tx = to.x - 1; // last char left of the target box
 
+  // Verticals may only live in the inter-column gap, never inside a column
+  // where a narrower sibling box would be pierced.
+  const gapStart = colRights[from.layer] ?? sx;
   if (to.layer === from.layer + 1) {
     // Single-gap elbow: out, turn, in.
     const used = gapUse.get(from.layer) ?? 0;
     gapUse.set(from.layer, used + 1);
-    const xm = Math.min(sx + 2 + used * 2, tx - 2);
+    const xm = Math.min(gapStart + 1 + used * 2, tx - 2);
     if (sy === ty) {
       c.hline(sx, tx - 1, sy);
     } else {
@@ -271,7 +302,7 @@ function drawEdge(
   // Multi-layer span: drop to a bus row below the diagram, travel, rise.
   const bus = height + 1 + (gapUse.get(-1) ?? 0);
   gapUse.set(-1, (gapUse.get(-1) ?? 0) + 1);
-  const x1 = sx + 1;
+  const x1 = Math.max(sx + 1, (colRights[from.layer] ?? sx) + 1);
   const x2 = tx - 2;
   c.hline(sx, x1 - 1, sy);
   c.put(x1, sy, "\u2510");

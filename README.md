@@ -90,3 +90,7 @@ is no terminal-native Typst renderer to lean on yet.
 
 Known behavior: an uppercase `[X]` marker normalizes to `[x]` after a toggle
 round-trip; the unchecked state cannot carry the case bit.
+
+Syntax highlighting covers the grammars @opentui/core ships: typescript,
+javascript, zig (plus markdown itself). Other languages render as unstyled
+code blocks; runtime grammar download is a planned follow-up.

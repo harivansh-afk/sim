@@ -29,7 +29,8 @@ function countChar(text: string, wanted: string): number {
 }
 
 function countBoxCorners(text: string): number {
-  const corners: Record<string, true> = { "┌": true, "┐": true, "└": true, "┘": true };
+  // Boxes use rounded corners; square corners belong to edge routing.
+  const corners: Record<string, true> = { "╭": true, "╮": true, "╰": true, "╯": true };
   let count = 0;
   for (const char of text) {
     if (corners[char] === true) {

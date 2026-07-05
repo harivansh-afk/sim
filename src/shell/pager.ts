@@ -53,7 +53,7 @@ export async function runPager(path: string): Promise<void> {
     width: "100%",
     height: 1,
     content: "",
-    fg: palette.statusFg,
+    fg: palette.muted,
     bg: palette.statusBg,
   });
   frame.add(view.scroll);
