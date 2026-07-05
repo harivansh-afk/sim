@@ -1,10 +1,10 @@
 import {
-  ASCIIFontRenderable,
   MarkdownRenderable,
   Renderable,
   ScrollBoxRenderable,
   StyledText,
   TextRenderable,
+  bold,
   fg,
   getTreeSitterClient,
   type CliRenderer,
@@ -86,12 +86,16 @@ export class DocumentView {
       }
       flushRun();
       if (bigHeading !== undefined) {
+        // Terminals have no font sizes; h1 gets weight + a heavy anchor rule.
         this.addRow(
-          new ASCIIFontRenderable(this.ctx, {
+          new TextRenderable(this.ctx, {
             id: `blk-${block.id}`,
-            text: bigHeading,
-            font: "tiny",
-            color: palette.bright,
+            content: new StyledText([
+              bold(fg(palette.bright)(bigHeading)),
+              fg(palette.faint)(`\n${"\u2501".repeat(Math.max(4, bigHeading.length + 1))}`),
+            ]),
+            wrapMode: "word",
+            width: "100%",
             marginBottom: 1,
           }),
         );

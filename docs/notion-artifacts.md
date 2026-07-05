@@ -28,8 +28,8 @@ Notion only exports depths 1-3. Deeper ones exist in markdown anyway:
 
 - [ ] plain todo
 - [x] completed todo
-- [ ] todo with **bold** and `code` in the label
-  - [ ] nested todo under a todo
+- [x] todo with **bold** and `code` in the label
+  - [x] nested todo under a todo
 - [ ] toggle any of these with tab + x; the file changes by exactly 3 bytes
 
 ## Toggle lists
