@@ -1,4 +1,5 @@
 import {
+  ASCIIFontRenderable,
   MarkdownRenderable,
   Renderable,
   ScrollBoxRenderable,
@@ -58,6 +59,10 @@ export class DocumentView {
 
     const taskBlocks = new Set<BlockId>();
     for (const task of doc.tasks()) taskBlocks.add(task.blockId);
+    const h1Text = new Map<BlockId, string>();
+    for (const h of doc.outline()) {
+      if (h.depth === 1) h1Text.set(h.blockId, h.text);
+    }
 
     let runStart: Block | null = null;
     let runEnd: Block | null = null;
@@ -73,12 +78,25 @@ export class DocumentView {
     for (const block of doc.blocks) {
       const mermaid = block.node.type === "code" && block.node.lang === "mermaid";
       const interactive = taskBlocks.has(block.id);
-      if (!mermaid && !interactive) {
+      const bigHeading = h1Text.get(block.id);
+      if (!mermaid && !interactive && bigHeading === undefined) {
         runStart ??= block;
         runEnd = block;
         continue;
       }
       flushRun();
+      if (bigHeading !== undefined) {
+        this.addRow(
+          new ASCIIFontRenderable(this.ctx, {
+            id: `blk-${block.id}`,
+            text: bigHeading,
+            font: "tiny",
+            color: palette.bright,
+            marginBottom: 1,
+          }),
+        );
+        continue;
+      }
       if (mermaid && block.node.type === "code") {
         const art = renderMermaid(block.node.value, Math.max(40, this.ctx.terminalWidth - 6));
         if (art) {
